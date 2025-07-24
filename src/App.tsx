@@ -27,9 +27,12 @@ function App() {
   const [processedPdfUrl, setProcessedPdfUrl] = useState<string | null>(null)
 
   const onDrop = (acceptedFiles: File[]) => {
-    const pdfFiles = acceptedFiles.filter(file => file.type === 'application/pdf')
-    if (pdfFiles.length > 0) {
-      setUploadedFiles(prev => [...prev, ...pdfFiles])
+    const validFiles = acceptedFiles.filter(file => 
+      file.type === 'application/pdf' || 
+      file.type.startsWith('image/')
+    )
+    if (validFiles.length > 0) {
+      setUploadedFiles(prev => [...prev, ...validFiles])
       setProcessedPdfUrl(null)
     }
   }
@@ -46,7 +49,8 @@ function App() {
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
     onDrop,
     accept: {
-      'application/pdf': ['.pdf']
+      'application/pdf': ['.pdf'],
+      'image/*': ['.png', '.jpg', '.jpeg', '.webp']
     },
     multiple: true
   })
@@ -63,6 +67,52 @@ function App() {
     } catch {
       return false
     }
+  }
+
+  const validateImageFile = (file: File): boolean => {
+    return file.type.startsWith('image/') && 
+           ['image/png', 'image/jpeg', 'image/jpg', 'image/webp'].includes(file.type)
+  }
+
+  const imageToCanvas = (file: File): Promise<HTMLCanvasElement> => {
+    return new Promise((resolve, reject) => {
+      const img = new Image()
+      const canvas = document.createElement('canvas')
+      const ctx = canvas.getContext('2d')
+      
+      if (!ctx) {
+        reject(new Error('无法创建Canvas上下文'))
+        return
+      }
+
+      img.onload = () => {
+        canvas.width = img.width
+        canvas.height = img.height
+        ctx.drawImage(img, 0, 0)
+        resolve(canvas)
+      }
+      
+      img.onerror = () => reject(new Error('图片加载失败'))
+      img.src = URL.createObjectURL(file)
+    })
+  }
+
+  const canvasToImageBytes = async (canvas: HTMLCanvasElement): Promise<Uint8Array> => {
+    return new Promise((resolve, reject) => {
+      canvas.toBlob((blob) => {
+        if (!blob) {
+          reject(new Error('Canvas转换失败'))
+          return
+        }
+        const reader = new FileReader()
+        reader.onload = () => {
+          const arrayBuffer = reader.result as ArrayBuffer
+          resolve(new Uint8Array(arrayBuffer))
+        }
+        reader.onerror = () => reject(new Error('文件读取失败'))
+        reader.readAsArrayBuffer(blob)
+      }, 'image/png')
+    })
   }
 
   const processPdf = async () => {
@@ -101,47 +151,100 @@ function App() {
         const file = uploadedFiles[fileIndex]
         console.log(`处理第${fileIndex + 1}个文件:`, file.name)
         
-        const isValidPdf = await validatePdfFile(file)
-        if (!isValidPdf) {
-          console.warn(`跳过无效PDF文件: ${file.name}`)
-          continue
-        }
+        if (file.type.startsWith('image/')) {
+          // 处理图片文件
+          const isValidImage = validateImageFile(file)
+          if (!isValidImage) {
+            console.warn(`跳过无效图片文件: ${file.name}`)
+            continue
+          }
 
-        const arrayBuffer = await file.arrayBuffer()
-        console.log('文件读取成功，大小:', arrayBuffer.byteLength)
-        
-        const pdfDoc = await PDFDocument.load(arrayBuffer)
-        console.log('PDF加载成功')
-        
-        const pages = pdfDoc.getPages()
-        console.log('PDF页数:', pages.length)
-        
-        if (pages.length === 0) {
-          console.warn(`跳过空PDF文件: ${file.name}`)
-          continue
-        }
+          console.log('处理图片文件:', file.name)
+          
+          try {
+            // 将图片转换为Canvas
+            const canvas = await imageToCanvas(file)
+            const imageBytes = await canvasToImageBytes(canvas)
+            
+            // 创建临时PDF以获取页面对象
+            const tempPdf = await PDFDocument.create()
+            const pngImage = await tempPdf.embedPng(imageBytes)
+            const tempPage = tempPdf.addPage([pngImage.width, pngImage.height])
+            tempPage.drawImage(pngImage, { x: 0, y: 0 })
+            
+            const pageWidth = pngImage.width
+            const pageHeight = pngImage.height
+            
+            // 按报销单尺寸计算缩放比例
+            const scaleX = targetWidth / pageWidth
+            const scaleY = targetHeight / pageHeight
+            const scale = Math.min(scaleX, scaleY)
+            
+            const scaledWidth = pageWidth * scale
+            const scaledHeight = pageHeight * scale
+            
+            allPages.push({
+              page: tempPage,
+              originalWidth: pageWidth,
+              originalHeight: pageHeight,
+              scaledWidth,
+              scaledHeight,
+              fileName: file.name,
+              pageNumber: 1,
+              isImage: true,
+              imageBytes
+            })
+            
+            console.log(`图片处理完成: ${file.name}, 尺寸: ${pageWidth}x${pageHeight}`)
+          } catch (error) {
+            console.error(`处理图片文件失败: ${file.name}`, error)
+            continue
+          }
+        } else {
+          // 处理PDF文件
+          const isValidPdf = await validatePdfFile(file)
+          if (!isValidPdf) {
+            console.warn(`跳过无效PDF文件: ${file.name}`)
+            continue
+          }
 
-        for (let i = 0; i < pages.length; i++) {
-          const page = pages[i]
-          const { width: pageWidth, height: pageHeight } = page.getSize()
+          const arrayBuffer = await file.arrayBuffer()
+          console.log('文件读取成功，大小:', arrayBuffer.byteLength)
           
-          // 按报销单尺寸计算缩放比例
-          const scaleX = targetWidth / pageWidth
-          const scaleY = targetHeight / pageHeight
-          const scale = Math.min(scaleX, scaleY)
+          const pdfDoc = await PDFDocument.load(arrayBuffer)
+          console.log('PDF加载成功')
           
-          const scaledWidth = pageWidth * scale
-          const scaledHeight = pageHeight * scale
+          const pages = pdfDoc.getPages()
+          console.log('PDF页数:', pages.length)
           
-          allPages.push({
-            page,
-            originalWidth: pageWidth,
-            originalHeight: pageHeight,
-            scaledWidth,
-            scaledHeight,
-            fileName: file.name,
-            pageNumber: i + 1
-          })
+          if (pages.length === 0) {
+            console.warn(`跳过空PDF文件: ${file.name}`)
+            continue
+          }
+
+          for (let i = 0; i < pages.length; i++) {
+            const page = pages[i]
+            const { width: pageWidth, height: pageHeight } = page.getSize()
+            
+            // 按报销单尺寸计算缩放比例
+            const scaleX = targetWidth / pageWidth
+            const scaleY = targetHeight / pageHeight
+            const scale = Math.min(scaleX, scaleY)
+            
+            const scaledWidth = pageWidth * scale
+            const scaledHeight = pageHeight * scale
+            
+            allPages.push({
+              page,
+              originalWidth: pageWidth,
+              originalHeight: pageHeight,
+              scaledWidth,
+              scaledHeight,
+              fileName: file.name,
+              pageNumber: i + 1,
+              isImage: false
+            })
+          }
         }
       }
 
@@ -222,22 +325,34 @@ function App() {
 
         console.log(`在位置 (${currentX}, ${currentY}) 放置发票: ${pageInfo.fileName} 第${pageInfo.pageNumber}页`)
 
-        // 嵌入并绘制发票页面
-        const embeddedPage = await outputPdf.embedPage(pageInfo.page)
-        
         // 计算发票在当前位置的坐标
         const invoiceX = currentX + 5 // 5px的裁剪线边距
         const invoiceY = currentY + 5
         
         if (currentPage) {
-          currentPage.drawPage(embeddedPage, {
-            x: invoiceX,
-            y: invoiceY,
-            width: pageInfo.scaledWidth,
-            height: pageInfo.scaledHeight
-          })
-          
-          // 绘制裁剪线框 - 避免与页脚重叠
+          if (pageInfo.isImage && pageInfo.imageBytes) {
+            // 处理图片文件：直接嵌入图片
+            const pngImage = await outputPdf.embedPng(pageInfo.imageBytes)
+            currentPage.drawImage(pngImage, {
+              x: invoiceX,
+              y: invoiceY,
+              width: pageInfo.scaledWidth,
+              height: pageInfo.scaledHeight
+            })
+          } else {
+            // 处理PDF文件：嵌入页面
+            const embeddedPage = await outputPdf.embedPage(pageInfo.page)
+            currentPage.drawPage(embeddedPage, {
+              x: invoiceX,
+              y: invoiceY,
+              width: pageInfo.scaledWidth,
+              height: pageInfo.scaledHeight
+            })
+          }
+        }
+        
+        // 绘制裁剪线框 - 避免与页脚重叠
+        if (currentPage) {
           currentPage.drawRectangle({
             x: currentX,
             y: currentY,
@@ -318,15 +433,15 @@ function App() {
 
   return (
     <div className="app">
-      <h1>发票PDF尺寸调整工具</h1>
+      <h1>发票/支付截图尺寸调整工具</h1>
       
       <div className="upload-section">
         <div {...getRootProps()} className={`dropzone ${isDragActive ? 'active' : ''}`}>
           <input {...getInputProps()} />
           {uploadedFiles.length > 0 ? (
-            <p>已选择 {uploadedFiles.length} 个PDF文件</p>
+            <p>已选择 {uploadedFiles.length} 个文件</p>
           ) : (
-            <p>拖放PDF文件到这里，或点击选择文件（支持多选）</p>
+            <p>拖放PDF文件或图片到这里，或点击选择文件（支持多选）</p>
           )}
         </div>
         
@@ -350,7 +465,7 @@ function App() {
       </div>
 
       <div className="size-section">
-        <h3>选择报销单发票粘贴区域尺寸</h3>
+        <h3>选择报销单粘贴区域尺寸</h3>
         
         <div className="size-options">
           <label>
@@ -428,10 +543,10 @@ function App() {
           <div className="result-actions">
             <a 
               href={processedPdfUrl} 
-              download="resized-invoice.pdf"
+              download="resized-documents.pdf"
               className="download-btn"
             >
-              下载PDF
+              下载A4打印文件
             </a>
             <iframe 
               src={processedPdfUrl} 

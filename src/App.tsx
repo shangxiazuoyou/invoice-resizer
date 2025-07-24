@@ -4,6 +4,107 @@ import { PDFDocument, rgb, StandardFonts, PDFPage } from 'pdf-lib'
 import fontkit from '@pdf-lib/fontkit'
 import './App.css'
 
+// 错误类型常量
+const ErrorType = {
+  FILE_INVALID: 'FILE_INVALID',
+  FILE_CORRUPTED: 'FILE_CORRUPTED', 
+  FILE_ENCRYPTED: 'FILE_ENCRYPTED',
+  FILE_TOO_LARGE: 'FILE_TOO_LARGE',
+  FILE_EMPTY: 'FILE_EMPTY',
+  IMAGE_LOAD_FAILED: 'IMAGE_LOAD_FAILED',
+  IMAGE_FORMAT_UNSUPPORTED: 'IMAGE_FORMAT_UNSUPPORTED',
+  PDF_PARSE_FAILED: 'PDF_PARSE_FAILED',
+  PDF_NO_PAGES: 'PDF_NO_PAGES',
+  SIZE_INVALID: 'SIZE_INVALID',
+  MEMORY_INSUFFICIENT: 'MEMORY_INSUFFICIENT',
+  PROCESSING_FAILED: 'PROCESSING_FAILED',
+  CANVAS_ERROR: 'CANVAS_ERROR',
+  NETWORK_ERROR: 'NETWORK_ERROR'
+} as const
+
+type ErrorType = typeof ErrorType[keyof typeof ErrorType]
+
+// 自定义错误类
+class ProcessingError extends Error {
+  public readonly type: ErrorType
+  public readonly userMessage: string
+  public readonly suggestion: string
+  public readonly fileName?: string
+
+  constructor(type: ErrorType, userMessage: string, suggestion: string, fileName?: string, originalError?: Error) {
+    super(userMessage)
+    this.type = type
+    this.userMessage = userMessage
+    this.suggestion = suggestion
+    this.fileName = fileName
+    this.name = 'ProcessingError'
+    
+    if (originalError) {
+      this.stack = originalError.stack
+    }
+  }
+}
+
+// 错误信息配置
+const ERROR_CONFIGS = {
+  [ErrorType.FILE_INVALID]: {
+    message: '文件格式不支持',
+    suggestion: '请上传PDF文件或PNG/JPG/WebP格式的图片'
+  },
+  [ErrorType.FILE_CORRUPTED]: {
+    message: '文件已损坏或格式不正确',
+    suggestion: '请重新下载原始文件，或尝试其他格式的版本'
+  },
+  [ErrorType.FILE_ENCRYPTED]: {
+    message: 'PDF文件已加密',
+    suggestion: '请先解除PDF密码保护，或将PDF另存为新文件'
+  },
+  [ErrorType.FILE_TOO_LARGE]: {
+    message: '文件过大',
+    suggestion: '请压缩文件大小至50MB以下，或分批处理'
+  },
+  [ErrorType.FILE_EMPTY]: {
+    message: '文件为空或无有效内容',
+    suggestion: '请检查文件是否正常，或重新获取原始文件'
+  },
+  [ErrorType.IMAGE_LOAD_FAILED]: {
+    message: '图片加载失败',
+    suggestion: '请确认图片文件完整且未损坏，建议重新保存图片'
+  },
+  [ErrorType.IMAGE_FORMAT_UNSUPPORTED]: {
+    message: '图片格式不支持',
+    suggestion: '请将图片转换为PNG、JPG或WebP格式'
+  },
+  [ErrorType.PDF_PARSE_FAILED]: {
+    message: 'PDF解析失败',
+    suggestion: '请确认PDF文件正常，或尝试用PDF阅读器重新保存'
+  },
+  [ErrorType.PDF_NO_PAGES]: {
+    message: 'PDF文件没有页面',
+    suggestion: '请检查PDF文件是否有实际内容'
+  },
+  [ErrorType.SIZE_INVALID]: {
+    message: '目标尺寸设置无效',
+    suggestion: '请输入1-30cm范围内的有效数值'
+  },
+  [ErrorType.MEMORY_INSUFFICIENT]: {
+    message: '内存不足',
+    suggestion: '请关闭其他浏览器标签页，或分批处理较少文件'
+  },
+  [ErrorType.PROCESSING_FAILED]: {
+    message: '文件处理失败',
+    suggestion: '请重试，或尝试处理更小的文件'
+  },
+  [ErrorType.CANVAS_ERROR]: {
+    message: '图片处理出错',
+    suggestion: '请刷新页面重试，或更换浏览器'
+  },
+  [ErrorType.NETWORK_ERROR]: {
+    message: '网络连接异常',
+    suggestion: '请检查网络连接后重试'
+  }
+}
+
 interface SizePreset {
   name: string
   width: number
@@ -17,6 +118,11 @@ const SIZE_PRESETS: SizePreset[] = [
   { name: '大报销单 (15×20cm)', width: 425.20, height: 566.93 }
 ]
 
+interface ErrorState {
+  error: ProcessingError | null
+  isVisible: boolean
+}
+
 function App() {
   const [uploadedFiles, setUploadedFiles] = useState<File[]>([])
   const [selectedPreset, setSelectedPreset] = useState<SizePreset>(SIZE_PRESETS[0])
@@ -25,6 +131,16 @@ function App() {
   const [useCustomSize, setUseCustomSize] = useState(false)
   const [isProcessing, setIsProcessing] = useState(false)
   const [processedPdfUrl, setProcessedPdfUrl] = useState<string | null>(null)
+  const [errorState, setErrorState] = useState<ErrorState>({ error: null, isVisible: false })
+
+  const showError = (error: ProcessingError) => {
+    setErrorState({ error, isVisible: true })
+    console.error('处理错误:', error)
+  }
+
+  const hideError = () => {
+    setErrorState({ error: null, isVisible: false })
+  }
 
   const onDrop = (acceptedFiles: File[]) => {
     const validFiles = acceptedFiles.filter(file => 
@@ -57,21 +173,54 @@ function App() {
 
   const cmToPt = (cm: number) => cm * 28.346
 
-  const validatePdfFile = async (file: File): Promise<boolean> => {
+  const validatePdfFile = async (file: File): Promise<void> => {
+    const MAX_FILE_SIZE = 50 * 1024 * 1024 // 50MB
+    
+    if (file.size === 0) {
+      throw new ProcessingError(ErrorType.FILE_EMPTY, ERROR_CONFIGS[ErrorType.FILE_EMPTY].message, ERROR_CONFIGS[ErrorType.FILE_EMPTY].suggestion, file.name)
+    }
+    
+    if (file.size > MAX_FILE_SIZE) {
+      throw new ProcessingError(ErrorType.FILE_TOO_LARGE, ERROR_CONFIGS[ErrorType.FILE_TOO_LARGE].message, ERROR_CONFIGS[ErrorType.FILE_TOO_LARGE].suggestion, file.name)
+    }
+
     try {
       const arrayBuffer = await file.arrayBuffer()
-      const header = new Uint8Array(arrayBuffer.slice(0, 5))
-      const pdfSignature = '%PDF'
+      const header = new Uint8Array(arrayBuffer.slice(0, 8))
       const headerString = Array.from(header).map(byte => String.fromCharCode(byte)).join('')
-      return headerString.startsWith(pdfSignature)
-    } catch {
-      return false
+      
+      if (!headerString.startsWith('%PDF')) {
+        throw new ProcessingError(ErrorType.FILE_INVALID, ERROR_CONFIGS[ErrorType.FILE_INVALID].message, ERROR_CONFIGS[ErrorType.FILE_INVALID].suggestion, file.name)
+      }
+      
+      // 检查是否加密
+      const textContent = new TextDecoder().decode(arrayBuffer.slice(0, Math.min(arrayBuffer.byteLength, 2048)))
+      if (textContent.includes('/Encrypt') && !textContent.includes('/V 0')) {
+        throw new ProcessingError(ErrorType.FILE_ENCRYPTED, ERROR_CONFIGS[ErrorType.FILE_ENCRYPTED].message, ERROR_CONFIGS[ErrorType.FILE_ENCRYPTED].suggestion, file.name)
+      }
+    } catch (error) {
+      if (error instanceof ProcessingError) {
+        throw error
+      }
+      throw new ProcessingError(ErrorType.FILE_CORRUPTED, ERROR_CONFIGS[ErrorType.FILE_CORRUPTED].message, ERROR_CONFIGS[ErrorType.FILE_CORRUPTED].suggestion, file.name, error as Error)
     }
   }
 
-  const validateImageFile = (file: File): boolean => {
-    return file.type.startsWith('image/') && 
-           ['image/png', 'image/jpeg', 'image/jpg', 'image/webp'].includes(file.type)
+  const validateImageFile = (file: File): void => {
+    const MAX_FILE_SIZE = 20 * 1024 * 1024 // 20MB for images
+    const SUPPORTED_TYPES = ['image/png', 'image/jpeg', 'image/jpg', 'image/webp']
+    
+    if (file.size === 0) {
+      throw new ProcessingError(ErrorType.FILE_EMPTY, ERROR_CONFIGS[ErrorType.FILE_EMPTY].message, ERROR_CONFIGS[ErrorType.FILE_EMPTY].suggestion, file.name)
+    }
+    
+    if (file.size > MAX_FILE_SIZE) {
+      throw new ProcessingError(ErrorType.FILE_TOO_LARGE, ERROR_CONFIGS[ErrorType.FILE_TOO_LARGE].message, ERROR_CONFIGS[ErrorType.FILE_TOO_LARGE].suggestion, file.name)
+    }
+    
+    if (!file.type.startsWith('image/') || !SUPPORTED_TYPES.includes(file.type)) {
+      throw new ProcessingError(ErrorType.IMAGE_FORMAT_UNSUPPORTED, ERROR_CONFIGS[ErrorType.IMAGE_FORMAT_UNSUPPORTED].message, ERROR_CONFIGS[ErrorType.IMAGE_FORMAT_UNSUPPORTED].suggestion, file.name)
+    }
   }
 
   const imageToCanvas = (file: File): Promise<HTMLCanvasElement> => {
@@ -81,37 +230,74 @@ function App() {
       const ctx = canvas.getContext('2d')
       
       if (!ctx) {
-        reject(new Error('无法创建Canvas上下文'))
+        reject(new ProcessingError(ErrorType.CANVAS_ERROR, ERROR_CONFIGS[ErrorType.CANVAS_ERROR].message, ERROR_CONFIGS[ErrorType.CANVAS_ERROR].suggestion, file.name))
         return
       }
 
+      const timeout = setTimeout(() => {
+        reject(new ProcessingError(ErrorType.IMAGE_LOAD_FAILED, ERROR_CONFIGS[ErrorType.IMAGE_LOAD_FAILED].message, ERROR_CONFIGS[ErrorType.IMAGE_LOAD_FAILED].suggestion, file.name))
+      }, 30000) // 30秒超时
+
       img.onload = () => {
-        canvas.width = img.width
-        canvas.height = img.height
-        ctx.drawImage(img, 0, 0)
-        resolve(canvas)
+        clearTimeout(timeout)
+        try {
+          // 检查图片尺寸是否合理
+          if (img.width === 0 || img.height === 0) {
+            reject(new ProcessingError(ErrorType.IMAGE_LOAD_FAILED, ERROR_CONFIGS[ErrorType.IMAGE_LOAD_FAILED].message, ERROR_CONFIGS[ErrorType.IMAGE_LOAD_FAILED].suggestion, file.name))
+            return
+          }
+          
+          // 检查图片是否过大（内存限制）
+          if (img.width * img.height > 50 * 1024 * 1024) { // 50M pixels
+            reject(new ProcessingError(ErrorType.MEMORY_INSUFFICIENT, ERROR_CONFIGS[ErrorType.MEMORY_INSUFFICIENT].message, ERROR_CONFIGS[ErrorType.MEMORY_INSUFFICIENT].suggestion, file.name))
+            return
+          }
+          
+          canvas.width = img.width
+          canvas.height = img.height
+          ctx.drawImage(img, 0, 0)
+          resolve(canvas)
+        } catch (error) {
+          reject(new ProcessingError(ErrorType.CANVAS_ERROR, ERROR_CONFIGS[ErrorType.CANVAS_ERROR].message, ERROR_CONFIGS[ErrorType.CANVAS_ERROR].suggestion, file.name, error as Error))
+        }
       }
       
-      img.onerror = () => reject(new Error('图片加载失败'))
-      img.src = URL.createObjectURL(file)
+      img.onerror = () => {
+        clearTimeout(timeout)
+        reject(new ProcessingError(ErrorType.IMAGE_LOAD_FAILED, ERROR_CONFIGS[ErrorType.IMAGE_LOAD_FAILED].message, ERROR_CONFIGS[ErrorType.IMAGE_LOAD_FAILED].suggestion, file.name))
+      }
+      
+      try {
+        img.src = URL.createObjectURL(file)
+      } catch (error) {
+        clearTimeout(timeout)
+        reject(new ProcessingError(ErrorType.PROCESSING_FAILED, ERROR_CONFIGS[ErrorType.PROCESSING_FAILED].message, ERROR_CONFIGS[ErrorType.PROCESSING_FAILED].suggestion, file.name, error as Error))
+      }
     })
   }
 
-  const canvasToImageBytes = async (canvas: HTMLCanvasElement): Promise<Uint8Array> => {
+  const canvasToImageBytes = async (canvas: HTMLCanvasElement, fileName: string): Promise<Uint8Array> => {
     return new Promise((resolve, reject) => {
-      canvas.toBlob((blob) => {
-        if (!blob) {
-          reject(new Error('Canvas转换失败'))
-          return
-        }
-        const reader = new FileReader()
-        reader.onload = () => {
-          const arrayBuffer = reader.result as ArrayBuffer
-          resolve(new Uint8Array(arrayBuffer))
-        }
-        reader.onerror = () => reject(new Error('文件读取失败'))
-        reader.readAsArrayBuffer(blob)
-      }, 'image/png')
+      try {
+        canvas.toBlob((blob) => {
+          if (!blob) {
+            reject(new ProcessingError(ErrorType.CANVAS_ERROR, ERROR_CONFIGS[ErrorType.CANVAS_ERROR].message, ERROR_CONFIGS[ErrorType.CANVAS_ERROR].suggestion, fileName))
+            return
+          }
+          
+          const reader = new FileReader()
+          reader.onload = () => {
+            const arrayBuffer = reader.result as ArrayBuffer
+            resolve(new Uint8Array(arrayBuffer))
+          }
+          reader.onerror = () => {
+            reject(new ProcessingError(ErrorType.PROCESSING_FAILED, ERROR_CONFIGS[ErrorType.PROCESSING_FAILED].message, ERROR_CONFIGS[ErrorType.PROCESSING_FAILED].suggestion, fileName))
+          }
+          reader.readAsArrayBuffer(blob)
+        }, 'image/png')
+      } catch (error) {
+        reject(new ProcessingError(ErrorType.CANVAS_ERROR, ERROR_CONFIGS[ErrorType.CANVAS_ERROR].message, ERROR_CONFIGS[ErrorType.CANVAS_ERROR].suggestion, fileName, error as Error))
+      }
     })
   }
 
@@ -129,8 +315,8 @@ function App() {
         cmToPt(parseFloat(customHeight) || 0) : 
         selectedPreset.height
 
-      if (targetWidth <= 0 || targetHeight <= 0) {
-        throw new Error('目标尺寸必须大于0')
+      if (targetWidth <= 0 || targetHeight <= 0 || isNaN(targetWidth) || isNaN(targetHeight)) {
+        throw new ProcessingError(ErrorType.SIZE_INVALID, ERROR_CONFIGS[ErrorType.SIZE_INVALID].message, ERROR_CONFIGS[ErrorType.SIZE_INVALID].suggestion)
       }
 
       console.log('报销单尺寸:', targetWidth, 'x', targetHeight, 'pt')
@@ -153,18 +339,13 @@ function App() {
         
         if (file.type.startsWith('image/')) {
           // 处理图片文件
-          const isValidImage = validateImageFile(file)
-          if (!isValidImage) {
-            console.warn(`跳过无效图片文件: ${file.name}`)
-            continue
-          }
-
-          console.log('处理图片文件:', file.name)
-          
           try {
+            validateImageFile(file)
+            console.log('处理图片文件:', file.name)
+            
             // 将图片转换为Canvas
             const canvas = await imageToCanvas(file)
-            const imageBytes = await canvasToImageBytes(canvas)
+            const imageBytes = await canvasToImageBytes(canvas, file.name)
             
             // 创建临时PDF以获取页面对象
             const tempPdf = await PDFDocument.create()
@@ -198,29 +379,29 @@ function App() {
             console.log(`图片处理完成: ${file.name}, 尺寸: ${pageWidth}x${pageHeight}`)
           } catch (error) {
             console.error(`处理图片文件失败: ${file.name}`, error)
-            continue
+            if (error instanceof ProcessingError) {
+              throw error // 向上传播详细错误
+            }
+            throw new ProcessingError(ErrorType.IMAGE_LOAD_FAILED, ERROR_CONFIGS[ErrorType.IMAGE_LOAD_FAILED].message, ERROR_CONFIGS[ErrorType.IMAGE_LOAD_FAILED].suggestion, file.name, error as Error)
           }
         } else {
           // 处理PDF文件
-          const isValidPdf = await validatePdfFile(file)
-          if (!isValidPdf) {
-            console.warn(`跳过无效PDF文件: ${file.name}`)
-            continue
-          }
+          try {
+            await validatePdfFile(file)
+            console.log('处理PDF文件:', file.name)
 
-          const arrayBuffer = await file.arrayBuffer()
-          console.log('文件读取成功，大小:', arrayBuffer.byteLength)
-          
-          const pdfDoc = await PDFDocument.load(arrayBuffer)
-          console.log('PDF加载成功')
-          
-          const pages = pdfDoc.getPages()
-          console.log('PDF页数:', pages.length)
-          
-          if (pages.length === 0) {
-            console.warn(`跳过空PDF文件: ${file.name}`)
-            continue
-          }
+            const arrayBuffer = await file.arrayBuffer()
+            console.log('文件读取成功，大小:', arrayBuffer.byteLength)
+            
+            const pdfDoc = await PDFDocument.load(arrayBuffer)
+            console.log('PDF加载成功')
+            
+            const pages = pdfDoc.getPages()
+            console.log('PDF页数:', pages.length)
+            
+            if (pages.length === 0) {
+              throw new ProcessingError(ErrorType.PDF_NO_PAGES, ERROR_CONFIGS[ErrorType.PDF_NO_PAGES].message, ERROR_CONFIGS[ErrorType.PDF_NO_PAGES].suggestion, file.name)
+            }
 
           for (let i = 0; i < pages.length; i++) {
             const page = pages[i]
@@ -244,6 +425,24 @@ function App() {
               pageNumber: i + 1,
               isImage: false
             })
+          }
+          } catch (error) {
+            console.error(`处理PDF文件失败: ${file.name}`, error)
+            if (error instanceof ProcessingError) {
+              throw error // 向上传播详细错误
+            }
+            
+            // 根据错误类型进行分类
+            if (error instanceof Error) {
+              if (error.message.includes('Invalid PDF') || error.message.includes('corrupted')) {
+                throw new ProcessingError(ErrorType.PDF_PARSE_FAILED, ERROR_CONFIGS[ErrorType.PDF_PARSE_FAILED].message, ERROR_CONFIGS[ErrorType.PDF_PARSE_FAILED].suggestion, file.name, error)
+              }
+              if (error.message.includes('encrypted')) {
+                throw new ProcessingError(ErrorType.FILE_ENCRYPTED, ERROR_CONFIGS[ErrorType.FILE_ENCRYPTED].message, ERROR_CONFIGS[ErrorType.FILE_ENCRYPTED].suggestion, file.name, error)
+              }
+            }
+            
+            throw new ProcessingError(ErrorType.PDF_PARSE_FAILED, ERROR_CONFIGS[ErrorType.PDF_PARSE_FAILED].message, ERROR_CONFIGS[ErrorType.PDF_PARSE_FAILED].suggestion, file.name, error as Error)
           }
         }
       }
@@ -408,24 +607,37 @@ function App() {
       
       console.log('处理完成')
     } catch (error) {
-      console.error('处理PDF时出错:', error)
+      console.error('处理文件时出错:', error)
       
-      let errorMessage = '处理PDF时出错: '
-      if (error instanceof Error) {
-        errorMessage += error.message
+      if (error instanceof ProcessingError) {
+        showError(error)
+      } else if (error instanceof Error) {
+        // 处理未预期的错误
+        let errorType: ErrorType = ErrorType.PROCESSING_FAILED
+        
+        if (error.message.includes('memory') || error.message.includes('Memory')) {
+          errorType = ErrorType.MEMORY_INSUFFICIENT
+        } else if (error.message.includes('network') || error.message.includes('Network')) {
+          errorType = ErrorType.NETWORK_ERROR
+        }
+        
+        const processingError = new ProcessingError(
+          errorType,
+          ERROR_CONFIGS[errorType].message,
+          ERROR_CONFIGS[errorType].suggestion,
+          undefined,
+          error
+        )
+        showError(processingError)
       } else {
-        errorMessage += '未知错误'
+        // 处理完全未知的错误
+        const unknownError = new ProcessingError(
+          ErrorType.PROCESSING_FAILED,
+          ERROR_CONFIGS[ErrorType.PROCESSING_FAILED].message,
+          ERROR_CONFIGS[ErrorType.PROCESSING_FAILED].suggestion
+        )
+        showError(unknownError)
       }
-      
-      if (error instanceof Error && error.message.includes('Invalid PDF')) {
-        errorMessage = 'PDF文件已损坏或格式不正确，请尝试重新下载发票'
-      } else if (error instanceof Error && error.message.includes('encrypted')) {
-        errorMessage = 'PDF文件已加密，请先解除密码保护'
-      } else if (error instanceof Error && error.message.includes('目标尺寸')) {
-        errorMessage = '请输入有效的目标尺寸'
-      }
-      
-      alert(errorMessage)
     } finally {
       setIsProcessing(false)
     }
@@ -434,6 +646,35 @@ function App() {
   return (
     <div className="app">
       <h1>发票/支付截图尺寸调整工具</h1>
+      
+      {errorState.isVisible && errorState.error && (
+        <div className="error-section">
+          <div className="error-content">
+            <div className="error-header">
+              <span className="error-icon">⚠️</span>
+              <h4 className="error-title">
+                {errorState.error.fileName ? `处理文件 "${errorState.error.fileName}" 时出错` : '处理出错'}
+              </h4>
+              <button onClick={hideError} className="error-close">×</button>
+            </div>
+            <div className="error-body">
+              <p className="error-message">{errorState.error.userMessage}</p>
+              <p className="error-suggestion">
+                <strong>解决建议：</strong>{errorState.error.suggestion}
+              </p>
+              {errorState.error.type === ErrorType.FILE_TOO_LARGE && (
+                <div className="error-details">
+                  <p>文件大小限制：</p>
+                  <ul>
+                    <li>PDF文件：最大50MB</li>
+                    <li>图片文件：最大20MB</li>
+                  </ul>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
       
       <div className="upload-section">
         <div {...getRootProps()} className={`dropzone ${isDragActive ? 'active' : ''}`}>

@@ -2,6 +2,8 @@ import { useState } from 'react'
 import { useDropzone } from 'react-dropzone'
 import { PDFDocument, rgb, StandardFonts, PDFPage } from 'pdf-lib'
 import fontkit from '@pdf-lib/fontkit'
+import * as XLSX from 'xlsx'
+import html2canvas from 'html2canvas'
 import './App.css'
 
 // 错误类型常量
@@ -15,6 +17,9 @@ const ErrorType = {
   IMAGE_FORMAT_UNSUPPORTED: 'IMAGE_FORMAT_UNSUPPORTED',
   PDF_PARSE_FAILED: 'PDF_PARSE_FAILED',
   PDF_NO_PAGES: 'PDF_NO_PAGES',
+  EXCEL_PARSE_FAILED: 'EXCEL_PARSE_FAILED',
+  EXCEL_NO_SHEETS: 'EXCEL_NO_SHEETS',
+  EXCEL_FORMAT_UNSUPPORTED: 'EXCEL_FORMAT_UNSUPPORTED',
   SIZE_INVALID: 'SIZE_INVALID',
   MEMORY_INSUFFICIENT: 'MEMORY_INSUFFICIENT',
   PROCESSING_FAILED: 'PROCESSING_FAILED',
@@ -49,7 +54,7 @@ class ProcessingError extends Error {
 const ERROR_CONFIGS = {
   [ErrorType.FILE_INVALID]: {
     message: '文件格式不支持',
-    suggestion: '请上传PDF文件或PNG/JPG/WebP格式的图片'
+    suggestion: '请上传PDF文件、PNG/JPG/WebP格式的图片或Excel文件(.xlsx/.xls)'
   },
   [ErrorType.FILE_CORRUPTED]: {
     message: '文件已损坏或格式不正确',
@@ -83,6 +88,18 @@ const ERROR_CONFIGS = {
     message: 'PDF文件没有页面',
     suggestion: '请检查PDF文件是否有实际内容'
   },
+  [ErrorType.EXCEL_PARSE_FAILED]: {
+    message: 'Excel文件解析失败',
+    suggestion: '请确认Excel文件正常，或尝试另存为xlsx格式'
+  },
+  [ErrorType.EXCEL_NO_SHEETS]: {
+    message: 'Excel文件没有工作表',
+    suggestion: '请检查Excel文件是否包含有效的工作表'
+  },
+  [ErrorType.EXCEL_FORMAT_UNSUPPORTED]: {
+    message: 'Excel文件格式不支持',
+    suggestion: '请将文件转换为.xlsx或.xls格式'
+  },
   [ErrorType.SIZE_INVALID]: {
     message: '目标尺寸设置无效',
     suggestion: '请输入1-30cm范围内的有效数值'
@@ -115,7 +132,8 @@ const SIZE_PRESETS: SizePreset[] = [
   { name: '小报销单 (5.5×8cm)', width: 155.91, height: 226.77 },
   { name: '中报销单 (8×12cm)', width: 226.77, height: 340.16 },
   { name: '标准报销单 (10×15cm)', width: 283.46, height: 425.20 },
-  { name: '大报销单 (15×20cm)', width: 425.20, height: 566.93 }
+  { name: '大报销单 (15×20cm)', width: 425.20, height: 566.93 },
+  { name: '超大报销单 (21×11cm)', width: 595.28, height: 311.81 }
 ]
 
 interface ErrorState {
@@ -145,7 +163,11 @@ function App() {
   const onDrop = (acceptedFiles: File[]) => {
     const validFiles = acceptedFiles.filter(file => 
       file.type === 'application/pdf' || 
-      file.type.startsWith('image/')
+      file.type.startsWith('image/') ||
+      file.type === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' ||
+      file.type === 'application/vnd.ms-excel' ||
+      file.name.toLowerCase().endsWith('.xlsx') ||
+      file.name.toLowerCase().endsWith('.xls')
     )
     if (validFiles.length > 0) {
       setUploadedFiles(prev => [...prev, ...validFiles])
@@ -166,7 +188,9 @@ function App() {
     onDrop,
     accept: {
       'application/pdf': ['.pdf'],
-      'image/*': ['.png', '.jpg', '.jpeg', '.webp']
+      'image/*': ['.png', '.jpg', '.jpeg', '.webp'],
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': ['.xlsx'],
+      'application/vnd.ms-excel': ['.xls']
     },
     multiple: true
   })
@@ -220,6 +244,30 @@ function App() {
     
     if (!file.type.startsWith('image/') || !SUPPORTED_TYPES.includes(file.type)) {
       throw new ProcessingError(ErrorType.IMAGE_FORMAT_UNSUPPORTED, ERROR_CONFIGS[ErrorType.IMAGE_FORMAT_UNSUPPORTED].message, ERROR_CONFIGS[ErrorType.IMAGE_FORMAT_UNSUPPORTED].suggestion, file.name)
+    }
+  }
+
+  const validateExcelFile = (file: File): void => {
+    const MAX_FILE_SIZE = 30 * 1024 * 1024 // 30MB for Excel files
+    const SUPPORTED_TYPES = [
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      'application/vnd.ms-excel'
+    ]
+    
+    if (file.size === 0) {
+      throw new ProcessingError(ErrorType.FILE_EMPTY, ERROR_CONFIGS[ErrorType.FILE_EMPTY].message, ERROR_CONFIGS[ErrorType.FILE_EMPTY].suggestion, file.name)
+    }
+    
+    if (file.size > MAX_FILE_SIZE) {
+      throw new ProcessingError(ErrorType.FILE_TOO_LARGE, ERROR_CONFIGS[ErrorType.FILE_TOO_LARGE].message, ERROR_CONFIGS[ErrorType.FILE_TOO_LARGE].suggestion, file.name)
+    }
+    
+    const isValidType = SUPPORTED_TYPES.includes(file.type) || 
+                       file.name.toLowerCase().endsWith('.xlsx') || 
+                       file.name.toLowerCase().endsWith('.xls')
+    
+    if (!isValidType) {
+      throw new ProcessingError(ErrorType.EXCEL_FORMAT_UNSUPPORTED, ERROR_CONFIGS[ErrorType.EXCEL_FORMAT_UNSUPPORTED].message, ERROR_CONFIGS[ErrorType.EXCEL_FORMAT_UNSUPPORTED].suggestion, file.name)
     }
   }
 
@@ -297,6 +345,135 @@ function App() {
         }, 'image/png')
       } catch (error) {
         reject(new ProcessingError(ErrorType.CANVAS_ERROR, ERROR_CONFIGS[ErrorType.CANVAS_ERROR].message, ERROR_CONFIGS[ErrorType.CANVAS_ERROR].suggestion, fileName, error as Error))
+      }
+    })
+  }
+
+  const excelToCanvas = async (file: File): Promise<HTMLCanvasElement> => {
+    return new Promise((resolve, reject) => {
+      try {
+        validateExcelFile(file)
+        console.log('处理Excel文件:', file.name)
+
+        const reader = new FileReader()
+        reader.onload = async (e) => {
+          try {
+            const data = new Uint8Array(e.target?.result as ArrayBuffer)
+            const workbook = XLSX.read(data, { type: 'array' })
+            
+            if (workbook.SheetNames.length === 0) {
+              reject(new ProcessingError(ErrorType.EXCEL_NO_SHEETS, ERROR_CONFIGS[ErrorType.EXCEL_NO_SHEETS].message, ERROR_CONFIGS[ErrorType.EXCEL_NO_SHEETS].suggestion, file.name))
+              return
+            }
+
+            // 取第一个工作表
+            const firstSheetName = workbook.SheetNames[0]
+            const worksheet = workbook.Sheets[firstSheetName]
+            
+            // 转换为HTML表格
+            const htmlTable = XLSX.utils.sheet_to_html(worksheet, {
+              id: 'excel-table',
+              editable: false
+            })
+
+            // 创建临时容器
+            const tempContainer = document.createElement('div')
+            tempContainer.style.position = 'absolute'
+            tempContainer.style.top = '-10000px'
+            tempContainer.style.left = '-10000px'
+            tempContainer.style.width = '595px' // A4宽度的像素值(210mm)
+            tempContainer.style.height = 'auto'
+            tempContainer.style.backgroundColor = 'white'
+            tempContainer.style.padding = '20px'
+            tempContainer.style.fontFamily = 'Arial, sans-serif'
+            tempContainer.style.fontSize = '11px'
+            tempContainer.style.boxSizing = 'border-box'
+            
+            tempContainer.innerHTML = htmlTable
+            
+            // 设置表格样式
+            const table = tempContainer.querySelector('table')
+            if (table) {
+              table.style.borderCollapse = 'collapse'
+              table.style.border = '1px solid #333'
+              table.style.width = '100%'
+              table.style.tableLayout = 'auto'
+              table.style.wordBreak = 'break-word'
+              
+              // 设置单元格样式
+              const cells = table.querySelectorAll('td, th')
+              cells.forEach(cell => {
+                const cellElement = cell as HTMLElement
+                cellElement.style.border = '1px solid #333'
+                cellElement.style.padding = '6px'
+                cellElement.style.textAlign = 'left'
+                cellElement.style.verticalAlign = 'top'
+                cellElement.style.whiteSpace = 'normal' // 允许换行
+                cellElement.style.wordWrap = 'break-word'
+                cellElement.style.backgroundColor = 'white'
+                cellElement.style.fontSize = '10px'
+                cellElement.style.lineHeight = '1.3'
+                cellElement.style.maxWidth = '150px' // 限制单元格最大宽度
+              })
+              
+              // 设置表头样式
+              const headers = table.querySelectorAll('th')
+              headers.forEach(header => {
+                const headerElement = header as HTMLElement
+                headerElement.style.backgroundColor = '#f5f5f5'
+                headerElement.style.fontWeight = 'bold'
+              })
+            }
+            
+            document.body.appendChild(tempContainer)
+            
+            // 使用html2canvas截图
+            const originalCanvas = await html2canvas(tempContainer, {
+              backgroundColor: 'white',
+              scale: 2,
+              useCORS: true,
+              allowTaint: true,
+              logging: false
+            })
+            
+            // 清理临时容器
+            document.body.removeChild(tempContainer)
+            
+            // 创建旋转90度的canvas
+            const rotatedCanvas = document.createElement('canvas')
+            const ctx = rotatedCanvas.getContext('2d')
+            
+            if (!ctx) {
+              reject(new ProcessingError(ErrorType.CANVAS_ERROR, ERROR_CONFIGS[ErrorType.CANVAS_ERROR].message, ERROR_CONFIGS[ErrorType.CANVAS_ERROR].suggestion, file.name))
+              return
+            }
+            
+            // 旋转后的尺寸：宽高互换
+            rotatedCanvas.width = originalCanvas.height
+            rotatedCanvas.height = originalCanvas.width
+            
+            // 移动到画布中心，旋转90度，然后绘制
+            ctx.translate(rotatedCanvas.width / 2, rotatedCanvas.height / 2)
+            ctx.rotate(Math.PI / 2) // 顺时针旋转90度
+            ctx.drawImage(originalCanvas, -originalCanvas.width / 2, -originalCanvas.height / 2)
+            
+            resolve(rotatedCanvas)
+          } catch (error) {
+            reject(new ProcessingError(ErrorType.EXCEL_PARSE_FAILED, ERROR_CONFIGS[ErrorType.EXCEL_PARSE_FAILED].message, ERROR_CONFIGS[ErrorType.EXCEL_PARSE_FAILED].suggestion, file.name, error as Error))
+          }
+        }
+
+        reader.onerror = () => {
+          reject(new ProcessingError(ErrorType.EXCEL_PARSE_FAILED, ERROR_CONFIGS[ErrorType.EXCEL_PARSE_FAILED].message, ERROR_CONFIGS[ErrorType.EXCEL_PARSE_FAILED].suggestion, file.name))
+        }
+
+        reader.readAsArrayBuffer(file)
+      } catch (error) {
+        if (error instanceof ProcessingError) {
+          reject(error)
+        } else {
+          reject(new ProcessingError(ErrorType.EXCEL_PARSE_FAILED, ERROR_CONFIGS[ErrorType.EXCEL_PARSE_FAILED].message, ERROR_CONFIGS[ErrorType.EXCEL_PARSE_FAILED].suggestion, file.name, error as Error))
+        }
       }
     })
   }
@@ -383,6 +560,55 @@ function App() {
               throw error // 向上传播详细错误
             }
             throw new ProcessingError(ErrorType.IMAGE_LOAD_FAILED, ERROR_CONFIGS[ErrorType.IMAGE_LOAD_FAILED].message, ERROR_CONFIGS[ErrorType.IMAGE_LOAD_FAILED].suggestion, file.name, error as Error)
+          }
+        } else if (file.type === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' || 
+                   file.type === 'application/vnd.ms-excel' ||
+                   file.name.toLowerCase().endsWith('.xlsx') ||
+                   file.name.toLowerCase().endsWith('.xls')) {
+          // 处理Excel文件
+          try {
+            console.log('处理Excel文件:', file.name)
+            
+            // 将Excel转换为Canvas
+            const canvas = await excelToCanvas(file)
+            const imageBytes = await canvasToImageBytes(canvas, file.name)
+            
+            // 创建临时PDF以获取页面对象
+            const tempPdf = await PDFDocument.create()
+            const pngImage = await tempPdf.embedPng(imageBytes)
+            const tempPage = tempPdf.addPage([pngImage.width, pngImage.height])
+            tempPage.drawImage(pngImage, { x: 0, y: 0 })
+            
+            const pageWidth = pngImage.width
+            const pageHeight = pngImage.height
+            
+            // 按报销单尺寸计算缩放比例
+            const scaleX = targetWidth / pageWidth
+            const scaleY = targetHeight / pageHeight
+            const scale = Math.min(scaleX, scaleY)
+            
+            const scaledWidth = pageWidth * scale
+            const scaledHeight = pageHeight * scale
+            
+            allPages.push({
+              page: tempPage,
+              originalWidth: pageWidth,
+              originalHeight: pageHeight,
+              scaledWidth,
+              scaledHeight,
+              fileName: file.name,
+              pageNumber: 1,
+              isImage: true,
+              imageBytes
+            })
+            
+            console.log(`Excel处理完成: ${file.name}, 尺寸: ${pageWidth}x${pageHeight}`)
+          } catch (error) {
+            console.error(`处理Excel文件失败: ${file.name}`, error)
+            if (error instanceof ProcessingError) {
+              throw error // 向上传播详细错误
+            }
+            throw new ProcessingError(ErrorType.EXCEL_PARSE_FAILED, ERROR_CONFIGS[ErrorType.EXCEL_PARSE_FAILED].message, ERROR_CONFIGS[ErrorType.EXCEL_PARSE_FAILED].suggestion, file.name, error as Error)
           }
         } else {
           // 处理PDF文件
@@ -645,7 +871,7 @@ function App() {
 
   return (
     <div className="app">
-      <h1>发票/支付截图尺寸调整工具</h1>
+      <h1>发票/支付截图/Excel尺寸调整工具</h1>
       
       {errorState.isVisible && errorState.error && (
         <div className="error-section">
@@ -682,7 +908,7 @@ function App() {
           {uploadedFiles.length > 0 ? (
             <p>已选择 {uploadedFiles.length} 个文件</p>
           ) : (
-            <p>拖放PDF文件或图片到这里，或点击选择文件（支持多选）</p>
+            <p>拖放PDF文件、图片或Excel文件到这里，或点击选择文件（支持多选）</p>
           )}
         </div>
         
